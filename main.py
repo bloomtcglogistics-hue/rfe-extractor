@@ -125,6 +125,13 @@ def process(req: ProcessRequest, background_tasks: BackgroundTasks):
         return {"status": "queued", "scope": "inbox"}
 
 
+@app.get("/process-inbox")
+def process_inbox_get(background_tasks: BackgroundTasks):
+    """GET-friendly trigger — visit this URL in a browser to process all PDFs in the inbox."""
+    background_tasks.add_task(process_inbox)
+    return {"status": "queued", "scope": "inbox", "message": "Processing started — check sheet in 30-60 seconds"}
+
+
 # ---------- Filename parser ----------
 FILENAME_PATTERN = re.compile(
     r"^AS_RFE_(?P<rfe>\d+)_(?P<month>\d{2})-(?P<day>\d{2})-(?P<year>\d{4})\.pdf$",
@@ -192,7 +199,7 @@ def extract_with_gemini(pdf_bytes: bytes) -> dict:
 
 
 # ---------- Sheets writer ----------
-def append_rows_to_sheet(tab: str, rows: list[list]):
+def append_rows_to_sheet(tab: str, rows: list):
     """Append rows to a tab in TCG Master."""
     body = {"values": rows}
     sheets_service.spreadsheets().values().append(
