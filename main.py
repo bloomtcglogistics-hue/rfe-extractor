@@ -1,46 +1,32 @@
 """
-RFE Extractor Service v4
-========================
+RFE Extractor Service v4.1
+==========================
 
-Priority shift from v3:
+Same as v4 but RENDER_SCALE dropped from 200/72 to 150/72.
+Reason: 200 DPI causes 504 Deadline Exceeded even on the per-page classify
+call. 150 DPI is the operational ceiling for Gemini Flash 2.5 on these PDFs.
+
+Priority order (unchanged from v4):
   Tier 1 (must be correct):
     - RFE number (from filename)
-    - Date received (RAW mode, kept from v3)
+    - Date received (RAW mode)
     - Size — must be correct, no hallucinated/dropped sizes
     - Description — must be correct, no truncation
   Tier 2 (acceptable as-is):
-    - Quantities — known imperfect on handwritten/checkmark-laden sheets;
-      manual correction in the master sheet is the accepted workflow
-  Tier 3 (new):
-    - Connex + Shelf location columns in the sheet
-    - AI-assisted bulk location assignment from natural-language input
+    - Quantities — manual correction in master sheet is accepted workflow
+  Tier 3 (new in v4):
+    - Connex + Shelf location columns
+    - AI-assisted bulk location assignment endpoints
     - Reprocess-quarantine endpoint
-    - OCR/AI diagnostic columns pushed to the far right of the sheet
+    - OCR/AI diagnostic columns pushed to far right of sheet
 
-Architectural changes from v3:
-  1. Format B Pass 1 is page-by-page. Each page goes to Gemini as its own
-     narrow call. Parent-description state is threaded forward so groups
-     spanning page breaks don't lose their parent anchor.
-  2. Format B Pass 1 prompt has explicit anti-hallucination rules:
-       - Sizes must visually exist on the page; do not invent them.
-       - Unclear quantities are OK (best guess); phantom sizes are not.
-  3. Post-process drops any row with an empty/invalid size before it reaches
-     the sheet. Dropped count is logged for audit.
-  4. Sheet schema reorganized:
-       Item-critical (left)  : Vendor, RFE Number, Date Received, PL Number,
-                               Quantity, Unit, Size, Description, Type,
-                               Foreman, Project Number
-       Location (middle, NEW): Connex, Shelf
-       Meta (right)          : Source Format, Source File, Extracted At,
-                               + validation cols on Needs Review
-  5. New endpoints:
-       GET  /reprocess-quarantine     — move quarantined files back to inbox
-       POST /assign-locations/preview — parse natural-language, return preview
-       POST /assign-locations/commit  — apply a preview to the sheet
-  6. Format A still single-call. Port to page-by-page in v5 if RFE 6969
-     audit shows it also drops/invents sizes.
+Architectural notes:
+  - Format B Pass 1 is page-by-page with parent-description carryover
+  - Anti-hallucination prompt rules + post-process filter on invalid sizes
+  - Two-pass cross-check validation (Pass 1 sums vs Pass 2 subtotals)
+  - Sheet schema: item-critical block | location block | meta block
 
-Manual Google Sheets one-time setup notes are at the bottom of this file.
+Manual Google Sheets setup notes at the bottom of this file.
 """
 
 import os
@@ -88,9 +74,9 @@ sheets_service = build("sheets", "v4", credentials=credentials)
 drive_service = build("drive", "v3", credentials=credentials)
 
 # ---------- Rasterization config ----------
-# 200 DPI. Page-by-page Pass 1 keeps each Gemini call's payload small,
-# so we can run full quality without 504 timeouts.
-RENDER_SCALE = 200 / 72  # ≈ 2.78
+# 150 DPI. 200 DPI causes 504s even on per-page classify calls.
+# Lower DPI loses some pixel disambiguation for handwriting but processes reliably.
+RENDER_SCALE = 150 / 72  # ≈ 2.08
 
 # ---------- Domain whitelists ----------
 ASME_STANDARDS = {"B16.5", "B16.9", "B16.11", "B16.25", "B16.47"}
@@ -112,7 +98,7 @@ META_COLUMNS_NEEDS_REVIEW = META_COLUMNS_AMERICAN_STAINLESS + [
 AMERICAN_STAINLESS_HEADERS = ITEM_COLUMNS + LOCATION_COLUMNS + META_COLUMNS_AMERICAN_STAINLESS
 NEEDS_REVIEW_HEADERS = ITEM_COLUMNS + LOCATION_COLUMNS + META_COLUMNS_NEEDS_REVIEW
 
-# Column index helpers
+
 def _col_letter(idx_0: int) -> str:
     letters = ""
     n = idx_0
@@ -122,6 +108,7 @@ def _col_letter(idx_0: int) -> str:
         if n < 0:
             break
     return letters
+
 
 COL_IDX_RFE_NUMBER = ITEM_COLUMNS.index("RFE Number")
 COL_IDX_SIZE = ITEM_COLUMNS.index("Size")
@@ -372,9 +359,8 @@ Return ONLY the JSON."""
 
 
 # ---------- FastAPI ----------
-app = FastAPI(title="RFE Extractor v4")
+app = FastAPI(title="RFE Extractor v4.1")
 
-# In-memory preview store. Lost on Railway restart — fine, previews are short-lived.
 LOCATION_PREVIEWS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -395,7 +381,7 @@ def health():
     return {
         "status": "ok",
         "service": "rfe-extractor",
-        "version": "v4",
+        "version": "v4.1",
         "time": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1101,28 +1087,33 @@ def assign_locations_commit_impl(preview_id: str) -> dict:
 # ════════════════════════════════════════════════════════════════════════════
 #
 # 1. Hit /process-inbox once with no files in the inbox. This triggers
-#    ensure_sheet_headers() which writes the v4 column headers to:
-#      - American Stainless (16 cols, row 1)
-#      - Needs Review (20 cols, row 1)
-#      - Quarantine (4 cols, row 1)
+#    ensure_sheet_headers() which writes v4 column headers to the three tabs
+#    if row 1 is empty.
 #
-# 2. Add Connex dropdown on each tab that has a Connex column:
-#    - On American Stainless: select range L2:L (Connex column)
-#    - Data → Data validation → +Add rule
-#    - Criteria: Dropdown
-#    - Values: Connex 1, Connex 2, Connex 3, Connex 4, Connex 5, Connex 6,
-#      Connex 7, Connex 8, Connex 9, Connex 10, Connex 11, Connex 12,
-#      Connex 13, Connex 14, Connex 15, Connex 16, Connex 17, Connex 18,
-#      Connex 19, Connex 20
-#    - Save
-#    - Repeat on Needs Review tab, same column letter L.
+# 2. American Stainless tab headers (16 cols):
+#      Vendor | RFE Number | Date Received | PL Number | Quantity | Unit |
+#      Size | Description | Type | Foreman | Project Number |
+#      Connex | Shelf |
+#      Source Format | Source File | Extracted At
 #
-# 3. (Optional) Freeze the header row: View → Freeze → 1 row.
+# 3. Needs Review tab headers (20 cols):
+#      [same 16 above] + Subtotal Match | Grand Total Match |
+#      Validation Method | Validation Notes
 #
-# 4. (Optional) Conditional formatting on Subtotal Match (Needs Review):
-#    - Text starts with FAIL → red background
-#    - Text starts with OK   → green background
+# 4. Quarantine tab headers (4 cols):
+#      Filename | Reason | Detected At | Notes
 #
-# 5. The Shelf column is free text (column M). No dropdown needed.
+# 5. Add Connex dropdown (data validation) on column L of both data tabs:
+#    - Cell range: 'American Stainless'!L:L (then repeat for Needs Review)
+#    - Criteria: List of items
+#    - Items: Connex 1,Connex 2,Connex 3,Connex 4,Connex 5,Connex 6,
+#             Connex 7,Connex 8,Connex 9,Connex 10,Connex 11,Connex 12,
+#             Connex 13,Connex 14,Connex 15,Connex 16,Connex 17,Connex 18,
+#             Connex 19,Connex 20
+#    - On invalid data: Reject input
+#
+# 6. (Optional) Freeze header row: View → Freeze → 1 row.
+#
+# 7. Shelf column (M) is free text — no dropdown.
 #
 # ════════════════════════════════════════════════════════════════════════════
