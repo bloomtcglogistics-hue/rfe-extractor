@@ -72,8 +72,8 @@ drive_service = build("drive", "v3", credentials=credentials)
 
 # ---------- Rasterization config ----------
 # 200 DPI: pypdfium2 takes a scale factor relative to its base 72 DPI.
-# 200 / 72 ≈ 2.78. We use 2.78 to land near 200 DPI.
-RENDER_SCALE = 200 / 72  # ≈ 2.78
+# 150 / 72 ≈ 2.08. Reduced from 200 DPI after Format B 504 timeouts on multi-page PDFs.
+RENDER_SCALE = 150 / 72  # ≈ 2.08
 
 # ---------- Domain whitelists for post-process snapping ----------
 ASME_STANDARDS = {"B16.5", "B16.9", "B16.11", "B16.25", "B16.47"}
