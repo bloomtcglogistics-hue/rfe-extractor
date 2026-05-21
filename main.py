@@ -1,39 +1,56 @@
 """
-RFE Extractor Service v3
-Extracts pipe takeoff data from American Stainless RFE PDFs via Gemini Flash 2.5
-and appends rows to the TCG Master Google Sheet.
+RFE Extractor Service v4
+========================
 
-v3 changes vs v2:
-- PDFs rasterized to PNG at 200 DPI before sending to Gemini (more pixels for
-  digit disambiguation; targets Format A handwritten two-digit qty truncation
-  caused by checkmarks adjacent to qty cells).
-- Format B uses TWO-PASS extraction:
-    Pass 1: line items only, NO subtotal awareness ("ignore bold numbers, extract
-            only indented quantities"). Gemini cannot fudge values to match a
-            target it does not see.
-    Pass 2: bold subtotals + grand total ONLY, anchored by parent description.
-    Validation cross-checks pass-1 sums vs pass-2 subtotals — Gemini's
-    self-report is no longer trusted.
-- Format classification is now a separate cheap pre-pass. Single round-trip
-  prompts that classified AND extracted let Gemini "see" the whole document
-  including subtotals; separating them keeps each call narrowly scoped.
-- Sheets append uses valueInputOption="RAW" so ISO date strings no longer get
-  coerced to Excel serial numbers (e.g. 46162 → 2026-05-20).
-- Post-process whitelists snap fabricated values to valid domain values:
-    * ASME standards: B16.5, B16.9, B16.11, B16.25, B16.47 (catches B16.111)
-    * Grade designations: WPB is real, WPE is not (snap WPE → WPB)
-- Format A prompt explicitly addresses the checkmark/two-digit qty failure mode.
-- Needs Review tab gets a 'validation_method' diagnostic column so failure modes
-  are distinguishable at a glance.
+Priority shift from v3:
+  Tier 1 (must be correct):
+    - RFE number (from filename)
+    - Date received (RAW mode, kept from v3)
+    - Size — must be correct, no hallucinated/dropped sizes
+    - Description — must be correct, no truncation
+  Tier 2 (acceptable as-is):
+    - Quantities — known imperfect on handwritten/checkmark-laden sheets;
+      manual correction in the master sheet is the accepted workflow
+  Tier 3 (new):
+    - Connex + Shelf location columns in the sheet
+    - AI-assisted bulk location assignment from natural-language input
+    - Reprocess-quarantine endpoint
+    - OCR/AI diagnostic columns pushed to the far right of the sheet
+
+Architectural changes from v3:
+  1. Format B Pass 1 is page-by-page. Each page goes to Gemini as its own
+     narrow call. Parent-description state is threaded forward so groups
+     spanning page breaks don't lose their parent anchor.
+  2. Format B Pass 1 prompt has explicit anti-hallucination rules:
+       - Sizes must visually exist on the page; do not invent them.
+       - Unclear quantities are OK (best guess); phantom sizes are not.
+  3. Post-process drops any row with an empty/invalid size before it reaches
+     the sheet. Dropped count is logged for audit.
+  4. Sheet schema reorganized:
+       Item-critical (left)  : Vendor, RFE Number, Date Received, PL Number,
+                               Quantity, Unit, Size, Description, Type,
+                               Foreman, Project Number
+       Location (middle, NEW): Connex, Shelf
+       Meta (right)          : Source Format, Source File, Extracted At,
+                               + validation cols on Needs Review
+  5. New endpoints:
+       GET  /reprocess-quarantine     — move quarantined files back to inbox
+       POST /assign-locations/preview — parse natural-language, return preview
+       POST /assign-locations/commit  — apply a preview to the sheet
+  6. Format A still single-call. Port to page-by-page in v5 if RFE 6969
+     audit shows it also drops/invents sizes.
+
+Manual Google Sheets one-time setup notes are at the bottom of this file.
 """
 
 import os
 import re
 import json
+import uuid
 import logging
 import io
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List, Dict, Any, Tuple
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
@@ -71,37 +88,64 @@ sheets_service = build("sheets", "v4", credentials=credentials)
 drive_service = build("drive", "v3", credentials=credentials)
 
 # ---------- Rasterization config ----------
-# 200 DPI: pypdfium2 takes a scale factor relative to its base 72 DPI.
-# 150 / 72 ≈ 2.08. Reduced from 200 DPI after Format B 504 timeouts on multi-page PDFs.
-RENDER_SCALE = 150 / 72  # ≈ 2.08
+# 200 DPI. Page-by-page Pass 1 keeps each Gemini call's payload small,
+# so we can run full quality without 504 timeouts.
+RENDER_SCALE = 200 / 72  # ≈ 2.78
 
-# ---------- Domain whitelists for post-process snapping ----------
+# ---------- Domain whitelists ----------
 ASME_STANDARDS = {"B16.5", "B16.9", "B16.11", "B16.25", "B16.47"}
-# Common ASTM grades for fittings/pipe. WPE is NOT a real grade — common
-# misread of WPB. Add others here as they come up.
 VALID_GRADES = {"WPB", "WPC", "WPHY", "WP11", "WP22", "WP91", "WP304", "WP316", "WP316L", "WP304L"}
 INVALID_TO_VALID_GRADE = {
-    "WPE": "WPB",   # WPE is not a real ASTM grade
+    "WPE": "WPB",
 }
+
+# ---------- Sheet schema (v4) ----------
+ITEM_COLUMNS = [
+    "Vendor", "RFE Number", "Date Received", "PL Number", "Quantity", "Unit",
+    "Size", "Description", "Type", "Foreman", "Project Number",
+]
+LOCATION_COLUMNS = ["Connex", "Shelf"]
+META_COLUMNS_AMERICAN_STAINLESS = ["Source Format", "Source File", "Extracted At"]
+META_COLUMNS_NEEDS_REVIEW = META_COLUMNS_AMERICAN_STAINLESS + [
+    "Subtotal Match", "Grand Total Match", "Validation Method", "Validation Notes",
+]
+AMERICAN_STAINLESS_HEADERS = ITEM_COLUMNS + LOCATION_COLUMNS + META_COLUMNS_AMERICAN_STAINLESS
+NEEDS_REVIEW_HEADERS = ITEM_COLUMNS + LOCATION_COLUMNS + META_COLUMNS_NEEDS_REVIEW
+
+# Column index helpers
+def _col_letter(idx_0: int) -> str:
+    letters = ""
+    n = idx_0
+    while True:
+        letters = chr(ord("A") + (n % 26)) + letters
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return letters
+
+COL_IDX_RFE_NUMBER = ITEM_COLUMNS.index("RFE Number")
+COL_IDX_SIZE = ITEM_COLUMNS.index("Size")
+COL_IDX_DESCRIPTION = ITEM_COLUMNS.index("Description")
+COL_IDX_CONNEX = len(ITEM_COLUMNS)
+COL_IDX_SHELF = len(ITEM_COLUMNS) + 1
 
 # ---------- Prompts ----------
 
-CLASSIFY_PROMPT = """Classify this American Stainless RFE PDF into ONE of three categories.
+CLASSIFY_PROMPT = """Classify this American Stainless RFE PDF.
 
 FORMAT A — "Detailed Takeoff":
-- A printed table with these column headers: PL QTY | Unit | Size | Description | Type | Foreman
-- Header context shows: "NSWV", "Pipe Takeoff", "CVE Project No. XXXXX"
-- Many rows, each with a foreman name (e.g. "Jacob Berry - HSM CW/R Bypass")
+- Printed table with columns: PL QTY | Unit | Size | Description | Type | Foreman
+- Header context: "NSWV", "Pipe Takeoff", "CVE Project No. XXXXX"
+- Many rows, each with a foreman name
 
 FORMAT B — "Pivot Summary":
-- Two columns labeled "Row Labels" (left) and "Sum of PL QTY" (right)
+- Two columns: "Row Labels" (left) and "Sum of PL QTY" (right)
 - Parent descriptions in left column with indented sizes below each
-- Bold subtotal numbers on parent rows in the right column
-- A "Grand Total" row at the bottom
+- Bold subtotal numbers on parent rows; "Grand Total" at the bottom
 
-UNKNOWN — neither of the above.
+UNKNOWN — neither.
 
-Return ONLY this JSON, nothing else:
+Return ONLY this JSON:
 {"format": "detailed" | "pivot" | "unknown"}"""
 
 
@@ -113,213 +157,237 @@ PL QTY | Unit | Size | Description | Type | Foreman
 ═══════════════════════════════════════════════════════════════════
 HANDWRITING — STRICT RULES
 ═══════════════════════════════════════════════════════════════════
-IGNORE all handwritten content. Specifically:
-- Handwritten RFE numbers, dates, signatures in the margins
-- Handwritten checkmarks (✓), tick marks, slashes, or pen strokes
-- Handwritten "Loaded" / "Substituted" / status notes
+IGNORE all handwritten content:
+- Handwritten RFE numbers, dates, signatures
+- Handwritten checkmarks (✓), tick marks, slashes, pen strokes
+- "Loaded" / "Substituted" / status notes
 - Strikethroughs, circles, underlines added in pen
-- ANY ink markings adjacent to or overlapping printed numbers
 
-CRITICAL — CHECKMARK INTERFERENCE WITH QUANTITIES:
-A common pattern on these sheets is a handwritten checkmark or tick mark
-placed in the same cell as (or directly adjacent to) a printed PL QTY value.
-The checkmark is NOT a digit. Specifically:
-- If a printed quantity is two digits (e.g. "15", "39", "14"), a checkmark to
-  its left or right may visually overlap and make the leading digit harder to
-  see. DO NOT drop the leading digit. Re-examine carefully.
-- Treat any 1-2 character mark with curves, hooks, or slashes that is not a
-  clear printed digit as a handwritten mark — ignore it.
-- After reading a quantity, sanity-check: PL QTY values on these sheets are
-  typically 1-200. If you extracted a single digit and there is ambiguous ink
-  next to it, look again for a leading digit before committing.
+CHECKMARK INTERFERENCE WITH QUANTITIES:
+A handwritten checkmark may sit in or next to a printed PL QTY cell.
+The checkmark is NOT a digit.
+- Two-digit qtys (15, 39, 14) may have a checkmark overlapping the leading
+  digit. Do NOT drop the leading digit. Re-examine.
+- Any 1-2 character mark with curves, hooks, or slashes that is not clearly
+  a printed digit is handwriting — ignore it.
 
 ═══════════════════════════════════════════════════════════════════
-CHARACTER DISAMBIGUATION
+SIZE & DESCRIPTION — ANTI-HALLUCINATION
 ═══════════════════════════════════════════════════════════════════
-- Pressure ratings are ALWAYS 150, 300, 600, 900, or 1500. NEVER 160.
-  If you see "160#" you are misreading "150#".
-- Flange face types are FF (Flat Face), RF (Raised Face), or RTJ. NEVER "PF".
-- ASTM grade designations: WPB is a real grade. WPE is NOT a real ASTM grade —
-  if you see "WPE" you are misreading "WPB". (Post-processing will also catch
-  this, but read it correctly the first time.)
-- ASME standards in descriptions are one of: B16.5, B16.9, B16.11, B16.25,
-  B16.47. There is no "B16.111" or "B16.1111" — those are misreads of B16.11.
-
-═══════════════════════════════════════════════════════════════════
-EXTRACTION
-═══════════════════════════════════════════════════════════════════
-For each row in the printed table, extract:
-- pl_qty (integer; preserve 0 explicitly; apply checkmark rule above)
-- unit (string: "ea", "ft", "lb", etc.)
-- size (number as string, e.g. "12.00", "0.50")
-- description (FULL text from Description column — do not truncate; this
-  includes the last row, which is often near the page bottom)
-- type (e.g. "tee", "elbow-90", "valve-ball", "valve-butterfly", "flange-RF",
-  "NBGs", "bolting", "nipple")
-- foreman (e.g. "Jacob Berry - HSM CW/R Bypass")
-- pl_number (e.g. "PL-0496", or "" if not present)
-
-Also extract:
-- project_number (e.g. "21180" from "CVE Project No. 21180"; "" if absent)
-
-═══════════════════════════════════════════════════════════════════
-OUTPUT
-═══════════════════════════════════════════════════════════════════
-Return ONLY this JSON, no markdown, no commentary:
-{
-  "project_number": "",
-  "rows": [
-    {
-      "pl_qty": 0,
-      "unit": "",
-      "size": "",
-      "description": "",
-      "type": "",
-      "foreman": "",
-      "pl_number": ""
-    }
-  ]
-}"""
-
-
-# Pass 1 of Format B: LINE ITEMS ONLY. Subtotals are intentionally hidden from
-# this prompt's instructions so Gemini cannot "adjust" line items to match a
-# target it does not see.
-FORMAT_B_LINE_ITEMS_PROMPT = """You are a precise data extraction system for American Stainless RFE pivot summary tables.
-
-This document is a PIVOT TABLE EXPORT with two columns:
-- LEFT ("Row Labels"): parent descriptions with indented sizes below each
-- RIGHT ("Sum of PL QTY"): numbers
-
-═══════════════════════════════════════════════════════════════════
-YOUR TASK — LINE ITEMS ONLY
-═══════════════════════════════════════════════════════════════════
-Extract ONLY the indented size rows and their corresponding quantities.
-
-DO NOT extract:
-- Bold subtotal numbers (those on the same row as a parent description)
-- The "Grand Total" number at the bottom
-
-Focus exclusively on:
-- Each indented size value in the left column
-- Its corresponding line item quantity in the right column (the non-bold
-  number directly to the right of that indented size, or the next non-bold
-  number in the right column following the indented size)
-- The parent description text that introduces the group the size belongs to
-
-═══════════════════════════════════════════════════════════════════
-GROUP STRUCTURE
-═══════════════════════════════════════════════════════════════════
-LEFT                                              RIGHT
-─────────────────────────────────────────────────────────────────
-Gasket, 150# FF 1/8" thick Garlock Blue-Gard...  76  ← IGNORE (bold subtotal)
-  3                                              38  ← extract: size 3, qty 38
-  4                                              25  ← extract: size 4, qty 25
-  6                                              13  ← extract: size 6, qty 13
-Gasket, 150# Ring 1/8" thick Flexitallic...     148  ← IGNORE (bold subtotal)
-  3                                              50  ← extract: size 3, qty 50
-  4                                               5  ← extract: size 4, qty 5
-  ...
-
-For each indented size, the parent_description is the most recent non-indented
-description above it in the left column.
-
-═══════════════════════════════════════════════════════════════════
-HANDWRITING — IGNORE
-═══════════════════════════════════════════════════════════════════
-Ignore all handwritten marks: checkmarks, dates, signatures, status notes.
-Extract only PRINTED values.
+- Sizes and descriptions MUST come directly from printed text on this page.
+- Do NOT infer sizes from context. If a row's size is unclear, return "" for
+  that row's size field — we will drop the row rather than guess.
+- Do NOT truncate descriptions. Read the FULL Description column text per row,
+  including the last row near the page bottom.
 
 ═══════════════════════════════════════════════════════════════════
 CHARACTER DISAMBIGUATION
 ═══════════════════════════════════════════════════════════════════
 - Pressure ratings: 150, 300, 600, 900, 1500 — never 160.
+- Flange face types: FF, RF, RTJ — never PF.
+- Grades: WPB is real; WPE is NOT (read as WPB).
+- ASME standards: B16.5, B16.9, B16.11, B16.25, B16.47 — never B16.111.
+
+═══════════════════════════════════════════════════════════════════
+EXTRACTION
+═══════════════════════════════════════════════════════════════════
+For each row, extract:
+- pl_qty (integer; preserve 0)
+- unit (string)
+- size (string — exact printed value; "" if unclear)
+- description (FULL Description column text; "" if unclear)
+- type (e.g. "tee", "elbow-90", "flange-RF", "NBGs")
+- foreman (e.g. "Jacob Berry - HSM CW/R Bypass")
+- pl_number (e.g. "PL-0496"; "" if absent)
+- project_number (e.g. "21180"; "" if absent)
+
+═══════════════════════════════════════════════════════════════════
+OUTPUT
+═══════════════════════════════════════════════════════════════════
+Return ONLY this JSON:
+{
+  "project_number": "",
+  "rows": [
+    {"pl_qty": 0, "unit": "", "size": "", "description": "",
+     "type": "", "foreman": "", "pl_number": ""}
+  ]
+}"""
+
+
+def format_b_line_items_prompt(last_parent_description: str, page_number: int, total_pages: int) -> str:
+    """Pass 1 prompt for ONE page of a Format B PDF. Threads parent-description carryover."""
+    if last_parent_description:
+        carryover = (
+            f"This is page {page_number} of {total_pages}.\n"
+            f"The previous page ended in the middle of a group whose parent description was:\n"
+            f'    "{last_parent_description}"\n'
+            f"If the first indented size rows on THIS page appear BEFORE any new parent description, "
+            f"they belong to that previous group. Use exactly that parent_description string for those rows."
+        )
+    else:
+        carryover = (
+            f"This is page {page_number} of {total_pages}.\n"
+            f"There is no carryover group from a previous page."
+        )
+
+    return f"""You are a precise data extraction system for American Stainless RFE pivot summary tables.
+
+This is ONE PAGE of a multi-page pivot table export with two columns:
+- LEFT ("Row Labels"): parent descriptions with indented sizes below each
+- RIGHT ("Sum of PL QTY"): numbers
+
+═══════════════════════════════════════════════════════════════════
+PAGE CONTINUITY
+═══════════════════════════════════════════════════════════════════
+{carryover}
+
+═══════════════════════════════════════════════════════════════════
+YOUR TASK — LINE ITEMS ONLY
+═══════════════════════════════════════════════════════════════════
+Extract ONLY the indented size rows and their corresponding quantities on
+THIS PAGE.
+
+DO NOT extract:
+- Bold subtotal numbers (on parent description rows)
+- The "Grand Total" number
+- Page headers, footers, or "RFE XXXX" stamps
+
+═══════════════════════════════════════════════════════════════════
+ANTI-HALLUCINATION — CRITICAL
+═══════════════════════════════════════════════════════════════════
+- Every `size` you return MUST be a number that VISUALLY APPEARS as an indented
+  value in the left column on this page. Do NOT invent sizes.
+- If a row in the right column has a number but you cannot find a matching
+  indented size in the left column for it, DO NOT MAKE ONE UP. Skip that row.
+- If a size IS visible but the quantity is unclear (overlapped by handwriting),
+  STILL capture the row — set pl_qty to your best read. Quantity errors are
+  acceptable; phantom sizes are not.
+- A real size with an unclear quantity is BETTER than skipping the row.
+
+═══════════════════════════════════════════════════════════════════
+PARENT DESCRIPTION ASSIGNMENT
+═══════════════════════════════════════════════════════════════════
+For each indented size, parent_description is the most recent non-indented
+description above it on this page — OR the carryover parent_description
+above (if the size appears before any new parent description on this page).
+
+Copy parent_description text EXACTLY as printed, including punctuation and the
+full description (do not truncate).
+
+═══════════════════════════════════════════════════════════════════
+HANDWRITING & DISAMBIGUATION
+═══════════════════════════════════════════════════════════════════
+- Ignore all handwritten marks.
+- Pressure ratings: 150, 300, 600, 900, 1500 — never 160.
 - Flange faces: FF, RF, RTJ — never PF.
-- Grades: WPB is real, WPE is not (read as WPB).
+- Grades: WPB real, WPE not (read as WPB).
 - ASME: B16.5, B16.9, B16.11, B16.25, B16.47 — never B16.111.
 
 ═══════════════════════════════════════════════════════════════════
 OUTPUT
 ═══════════════════════════════════════════════════════════════════
-Return ONLY this JSON, no markdown, no commentary:
-{
+Return ONLY this JSON:
+{{
   "project_number": "",
+  "last_parent_description_on_page": "",
   "rows": [
-    {
-      "parent_description": "",
-      "size": "",
-      "pl_qty": 0
-    }
+    {{"parent_description": "", "size": "", "pl_qty": 0}}
   ]
-}
+}}
 
-Capture EVERY indented size row across ALL groups, including groups that span
-page breaks. A group continues across pages until a new parent description
-appears."""
+`last_parent_description_on_page` = the most recent parent description that
+appeared on THIS page (used to thread continuity to the next page). If no new
+parent description appeared on this page, return the carryover value above."""
 
 
-# Pass 2 of Format B: SUBTOTALS + GRAND TOTAL ONLY. Line items are intentionally
-# hidden so Gemini focuses solely on the bold numbers.
 FORMAT_B_SUBTOTALS_PROMPT = """You are extracting validation anchors from an American Stainless RFE pivot summary.
 
-This document is a PIVOT TABLE EXPORT. Your task is narrow:
+YOUR TASK — SUBTOTALS AND GRAND TOTAL ONLY.
 
-═══════════════════════════════════════════════════════════════════
-YOUR TASK — SUBTOTALS AND GRAND TOTAL ONLY
-═══════════════════════════════════════════════════════════════════
-For each PARENT DESCRIPTION (non-indented row in the left column), capture:
+For each PARENT DESCRIPTION (non-indented row in the left column) across ALL pages, capture:
 - The parent_description text (full, exactly as printed)
 - The BOLD subtotal number on the same row in the right column
 
 Also capture:
-- The "Grand Total" number printed at the very bottom of the document
+- The "Grand Total" number printed at the very bottom of the document.
 
-DO NOT extract:
-- Indented size rows
-- Individual line item quantities
-
-═══════════════════════════════════════════════════════════════════
-LAYOUT REMINDER
-═══════════════════════════════════════════════════════════════════
-LEFT                                              RIGHT
-─────────────────────────────────────────────────────────────────
-Gasket, 150# FF 1/8" thick Garlock Blue-Gard...  76   ← capture this
-  3                                              38   ← ignore (line item)
-  4                                              25   ← ignore (line item)
-  ...
-Gasket, 150# Ring 1/8" thick Flexitallic...     148   ← capture this
-  ...
-Grand Total                                     942   ← capture as grand_total
-
-═══════════════════════════════════════════════════════════════════
-HANDWRITING — IGNORE
-═══════════════════════════════════════════════════════════════════
+DO NOT extract indented size rows or individual line item quantities.
 Ignore all handwritten marks.
 
-═══════════════════════════════════════════════════════════════════
-OUTPUT
-═══════════════════════════════════════════════════════════════════
-Return ONLY this JSON, no markdown, no commentary:
+Return ONLY this JSON:
 {
   "grand_total": 0,
   "subtotals": [
+    {"parent_description": "", "subtotal": 0}
+  ]
+}"""
+
+
+LOCATION_PARSE_PROMPT = """You are parsing a natural-language inventory location assignment from a foreman.
+
+The foreman is unpacking items from one or more RFE (Request For Equipment)
+shipments into storage containers called "Connex" (numbered Connex 1 through
+Connex 20) with named shelves (e.g. "A14", "B12").
+
+The foreman will describe in plain English which items went where. You will
+output a structured JSON list of assignments.
+
+INPUT EXAMPLES
+"RFE 5414, all the Garlock 150# Ring gaskets sizes 3 through 8, Connex 7,
+shelf B12. The Flexitallic CGI gaskets sizes 8 and 10, Connex 7, shelf B14."
+
+"5903 PL-0496 all 12in stuff to Connex 3 shelf A1"
+
+"Lap joint flanges from 5414, Connex 12 shelf top"
+
+OUTPUT SCHEMA
+{
+  "assignments": [
     {
-      "parent_description": "",
-      "subtotal": 0
+      "rfe_number": "5414",
+      "description_filter": "Garlock 150# Ring gasket",
+      "size_filter": ["3", "4", "6", "8"],
+      "connex": "Connex 7",
+      "shelf": "B12"
     }
   ]
 }
 
-The parent_description must match exactly the full printed text so it can be
-joined with line items extracted in a separate pass."""
+Rules:
+- rfe_number: digits only, no "RFE" prefix.
+- description_filter: short text string to substring-match against the
+  Description column. Most distinguishing words from the foreman's phrasing.
+  Empty "" means "match any description for this RFE".
+- size_filter: array of sizes as strings ("3", "0.5", "1.5"). Expand ranges
+  like "3 through 8" to standard pipe sizes in that range: usually 3, 4, 6, 8.
+  Skip 5 and 7 unless foreman explicitly says them. Empty [] means "match any".
+- connex: must be "Connex N" where N is 1-20. Normalize "C7", "con 7",
+  "connex seven" → "Connex 7".
+- shelf: short string as foreman said it (e.g. "B12", "top"). Empty "" if not specified.
+
+If ambiguous, include the partial assignment with empty fields — the matching
+will surface 0 rows and the user can refine.
+
+Return ONLY the JSON."""
 
 
-# ---------- FastAPI app ----------
-app = FastAPI(title="RFE Extractor v3")
+# ---------- FastAPI ----------
+app = FastAPI(title="RFE Extractor v4")
+
+# In-memory preview store. Lost on Railway restart — fine, previews are short-lived.
+LOCATION_PREVIEWS: Dict[str, Dict[str, Any]] = {}
 
 
 class ProcessRequest(BaseModel):
     file_id: Optional[str] = None
+
+
+class LocationPreviewRequest(BaseModel):
+    text: str
+
+
+class LocationCommitRequest(BaseModel):
+    preview_id: str
 
 
 @app.get("/")
@@ -327,27 +395,56 @@ def health():
     return {
         "status": "ok",
         "service": "rfe-extractor",
-        "version": "v3",
+        "version": "v4",
         "time": datetime.now(timezone.utc).isoformat(),
     }
 
 
 @app.post("/process")
 def process(req: ProcessRequest, background_tasks: BackgroundTasks):
-    """Trigger processing of one file or the entire inbox folder."""
     if req.file_id:
         background_tasks.add_task(process_single_file, req.file_id)
         return {"status": "queued", "file_id": req.file_id}
-    else:
-        background_tasks.add_task(process_inbox)
-        return {"status": "queued", "scope": "inbox"}
+    background_tasks.add_task(process_inbox)
+    return {"status": "queued", "scope": "inbox"}
 
 
 @app.get("/process-inbox")
 def process_inbox_get(background_tasks: BackgroundTasks):
-    """GET-friendly trigger — visit this URL in a browser to process all PDFs in the inbox."""
     background_tasks.add_task(process_inbox)
-    return {"status": "queued", "scope": "inbox", "message": "Processing started — check sheet in 30-90 seconds"}
+    return {
+        "status": "queued",
+        "scope": "inbox",
+        "message": "Processing started — check sheet in 30-90 seconds per file",
+    }
+
+
+@app.get("/reprocess-quarantine")
+def reprocess_quarantine_get(background_tasks: BackgroundTasks):
+    background_tasks.add_task(reprocess_quarantine)
+    return {
+        "status": "queued",
+        "scope": "quarantine",
+        "message": "Quarantined files being moved back to inbox and reprocessed",
+    }
+
+
+@app.post("/assign-locations/preview")
+def assign_locations_preview(req: LocationPreviewRequest):
+    try:
+        return assign_locations_preview_impl(req.text)
+    except Exception as e:
+        log.exception(f"Location preview failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/assign-locations/commit")
+def assign_locations_commit(req: LocationCommitRequest):
+    try:
+        return assign_locations_commit_impl(req.preview_id)
+    except Exception as e:
+        log.exception(f"Location commit failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------- Filename parser ----------
@@ -358,7 +455,6 @@ FILENAME_PATTERN = re.compile(
 
 
 def parse_filename(filename: str):
-    """Parse 'AS_RFE_5903_05-17-2026.pdf' into structured fields."""
     m = FILENAME_PATTERN.match(filename)
     if not m:
         return None
@@ -370,14 +466,14 @@ def parse_filename(filename: str):
 
 
 # ---------- Drive helpers ----------
-def list_inbox_pdfs():
-    q = (
-        f"'{DRIVE_INBOX_FOLDER_ID}' in parents "
-        f"and mimeType='application/pdf' "
-        f"and trashed=false"
-    )
+def list_folder_pdfs(folder_id: str):
+    q = f"'{folder_id}' in parents and mimeType='application/pdf' and trashed=false"
     results = drive_service.files().list(q=q, fields="files(id, name)").execute()
     return results.get("files", [])
+
+
+def list_inbox_pdfs():
+    return list_folder_pdfs(DRIVE_INBOX_FOLDER_ID)
 
 
 def download_pdf(file_id: str) -> bytes:
@@ -402,30 +498,25 @@ def move_file(file_id: str, dest_folder_id: str):
 
 
 # ---------- Rasterization ----------
-def rasterize_pdf_to_pngs(pdf_bytes: bytes) -> list:
-    """
-    Rasterize all pages of a PDF to PNG bytes at ~200 DPI.
-    Returns a list of {"mime_type": "image/png", "data": <bytes>} dicts ready
-    for Gemini multimodal input.
-    """
+def rasterize_pdf_pages(pdf_bytes: bytes) -> List[Dict[str, Any]]:
+    """One PNG per page."""
     pdf = pdfium.PdfDocument(pdf_bytes)
-    parts = []
+    pages = []
     try:
         for page_index in range(len(pdf)):
             page = pdf[page_index]
             pil_image = page.render(scale=RENDER_SCALE).to_pil()
             buf = io.BytesIO()
             pil_image.save(buf, format="PNG", optimize=True)
-            parts.append({"mime_type": "image/png", "data": buf.getvalue()})
+            pages.append({"mime_type": "image/png", "data": buf.getvalue()})
             page.close()
     finally:
         pdf.close()
-    return parts
+    return pages
 
 
 # ---------- Gemini calls ----------
 def _gemini_json_call(prompt: str, image_parts: list) -> dict:
-    """Call Gemini with a prompt and image parts, parse JSON response."""
     response = GEMINI_MODEL.generate_content([prompt] + image_parts)
     text = response.text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -434,72 +525,105 @@ def _gemini_json_call(prompt: str, image_parts: list) -> dict:
 
 
 def classify_format(image_parts: list) -> str:
-    """Pass 0: classify document format."""
-    result = _gemini_json_call(CLASSIFY_PROMPT, image_parts)
+    # First page only is enough to classify and keeps the call cheap.
+    first_page_only = image_parts[:1]
+    result = _gemini_json_call(CLASSIFY_PROMPT, first_page_only)
     return result.get("format", "unknown")
 
 
 def extract_format_a(image_parts: list) -> dict:
-    """Format A single-call extraction."""
     return _gemini_json_call(FORMAT_A_PROMPT, image_parts)
 
 
-def extract_format_b_line_items(image_parts: list) -> dict:
-    """Format B pass 1: line items only, no subtotal awareness."""
-    return _gemini_json_call(FORMAT_B_LINE_ITEMS_PROMPT, image_parts)
+def extract_format_b_line_items_per_page(image_parts: List[dict]) -> dict:
+    """Pass 1 — page-by-page with parent-description carryover."""
+    all_rows = []
+    last_parent = ""
+    project_number = ""
+    total_pages = len(image_parts)
+
+    for i, page_part in enumerate(image_parts, start=1):
+        prompt = format_b_line_items_prompt(last_parent, i, total_pages)
+        try:
+            result = _gemini_json_call(prompt, [page_part])
+        except Exception as e:
+            log.exception(f"Pass 1 failed on page {i}/{total_pages}: {e}")
+            continue
+
+        if not project_number:
+            project_number = result.get("project_number", "") or ""
+        page_rows = result.get("rows", []) or []
+        all_rows.extend(page_rows)
+        new_last = result.get("last_parent_description_on_page", "") or ""
+        if new_last:
+            last_parent = new_last
+        log.info(f"Pass 1 page {i}/{total_pages}: {len(page_rows)} row(s), carryover='{last_parent[:60]}'")
+
+    return {"project_number": project_number, "rows": all_rows}
 
 
 def extract_format_b_subtotals(image_parts: list) -> dict:
-    """Format B pass 2: subtotals + grand total only, no line item awareness."""
+    """Pass 2 — all pages together. Sparse content, fits in one call."""
     return _gemini_json_call(FORMAT_B_SUBTOTALS_PROMPT, image_parts)
 
 
-# ---------- Post-process whitelists ----------
+# ---------- Post-process ----------
 ASME_PATTERN = re.compile(r"\bB16\.\d{1,4}\b")
 WORD_PATTERN = re.compile(r"\b[A-Z]{2,5}\d{0,4}[A-Z]?\b")
 
 
 def _snap_asme(token: str) -> str:
-    """Snap a B16.XXX token to the nearest valid ASME standard."""
     if token in ASME_STANDARDS:
         return token
-    # Strip extra trailing digits: B16.111 → try B16.11, then B16.1
     match = re.match(r"^B16\.(\d+)$", token)
     if not match:
         return token
     digits = match.group(1)
-    # Try progressively shorter suffixes
     for n in range(len(digits), 0, -1):
         candidate = f"B16.{digits[:n]}"
         if candidate in ASME_STANDARDS:
             return candidate
-    return token  # No match — leave as-is
+    return token
 
 
 def _snap_grade(token: str) -> Optional[str]:
-    """Snap a grade token to its corrected value, or None if no rule applies."""
     return INVALID_TO_VALID_GRADE.get(token)
 
 
 def apply_whitelist_snaps(text: str) -> str:
-    """Apply post-process whitelist corrections to a text field."""
     if not text:
         return text
-    # ASME standards
-    def _asme_repl(m):
-        return _snap_asme(m.group(0))
-    text = ASME_PATTERN.sub(_asme_repl, text)
-    # Grade tokens — only replace known bad ones
-    def _grade_repl(m):
-        tok = m.group(0)
-        corrected = _snap_grade(tok)
-        return corrected if corrected else tok
-    text = WORD_PATTERN.sub(_grade_repl, text)
+    text = ASME_PATTERN.sub(lambda m: _snap_asme(m.group(0)), text)
+    text = WORD_PATTERN.sub(lambda m: _snap_grade(m.group(0)) or m.group(0), text)
     return text
 
 
+def is_size_valid(size: Any) -> bool:
+    """Valid = non-empty string that parses as a positive number."""
+    if size is None:
+        return False
+    s = str(size).strip()
+    if not s:
+        return False
+    try:
+        return float(s) > 0
+    except (ValueError, TypeError):
+        return False
+
+
+def filter_rows_with_valid_size(rows: List[dict]) -> Tuple[List[dict], int]:
+    """Drop rows where size is empty/invalid. Returns (kept, dropped_count)."""
+    kept = []
+    dropped = 0
+    for row in rows:
+        if is_size_valid(row.get("size")):
+            kept.append(row)
+        else:
+            dropped += 1
+    return kept, dropped
+
+
 def snap_row_fields(row: dict) -> dict:
-    """Apply whitelist snaps to text fields in an extracted row."""
     out = dict(row)
     for field in ("description", "type"):
         if field in out and isinstance(out[field], str):
@@ -507,9 +631,35 @@ def snap_row_fields(row: dict) -> dict:
     return out
 
 
-# ---------- Sheets writer ----------
+# ---------- Sheets I/O ----------
+def ensure_sheet_headers():
+    """Write v4 headers if row 1 of a tab is empty. Idempotent."""
+    targets = [
+        ("American Stainless", AMERICAN_STAINLESS_HEADERS),
+        ("Needs Review", NEEDS_REVIEW_HEADERS),
+        ("Quarantine", ["Filename", "Reason", "Detected At", "Notes"]),
+    ]
+    for tab, headers in targets:
+        try:
+            resp = sheets_service.spreadsheets().values().get(
+                spreadsheetId=SHEET_ID,
+                range=f"'{tab}'!1:1",
+            ).execute()
+            row = resp.get("values", [[]])
+            row_is_empty = not row or not row[0] or all(not c for c in row[0])
+            if row_is_empty:
+                sheets_service.spreadsheets().values().update(
+                    spreadsheetId=SHEET_ID,
+                    range=f"'{tab}'!A1",
+                    valueInputOption="RAW",
+                    body={"values": [headers]},
+                ).execute()
+                log.info(f"Wrote v4 headers to '{tab}'")
+        except Exception as e:
+            log.warning(f"Could not ensure headers on '{tab}': {e}")
+
+
 def append_rows_to_sheet(tab: str, rows: list):
-    """Append rows using RAW mode so date strings are not coerced to serials."""
     body = {"values": rows}
     sheets_service.spreadsheets().values().append(
         spreadsheetId=SHEET_ID,
@@ -527,21 +677,16 @@ def log_quarantine(filename: str, reason: str, notes: str = ""):
     )
 
 
+def read_tab(tab: str) -> List[List[str]]:
+    resp = sheets_service.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID,
+        range=f"'{tab}'!A:ZZ",
+    ).execute()
+    return resp.get("values", [])
+
+
 # ---------- Format B cross-pass validation ----------
 def validate_format_b_cross_pass(line_items: list, subtotals_payload: dict) -> dict:
-    """
-    Validates Format B by comparing pass-1 line item sums against pass-2 subtotals.
-    Gemini cannot fudge this because the two passes never see each other's targets.
-
-    Returns:
-      {
-        "passed": bool,
-        "subtotal_results": [...],
-        "grand_total_result": {...},
-        "method": "two-pass-cross-check"
-      }
-    """
-    # Sum line items per parent_description from pass 1
     sums_by_parent = {}
     for row in line_items:
         parent = row.get("parent_description", "")
@@ -554,17 +699,15 @@ def validate_format_b_cross_pass(line_items: list, subtotals_payload: dict) -> d
     subtotals = subtotals_payload.get("subtotals", []) or []
     grand_total = subtotals_payload.get("grand_total")
 
-    # Build lookup of pass-2 subtotals
     subtotal_by_parent = {}
     for s in subtotals:
         parent = s.get("parent_description", "")
         try:
-            subtotal_val = int(s.get("subtotal", 0) or 0)
+            v = int(s.get("subtotal", 0) or 0)
         except (ValueError, TypeError):
-            subtotal_val = 0
-        subtotal_by_parent[parent] = subtotal_val
+            v = 0
+        subtotal_by_parent[parent] = v
 
-    # Cross-check: every parent in either pass must appear in both, and sums must match
     all_parents = set(sums_by_parent.keys()) | set(subtotal_by_parent.keys())
     subtotal_results = []
     all_passed = True
@@ -574,28 +717,19 @@ def validate_format_b_cross_pass(line_items: list, subtotals_payload: dict) -> d
         actual = sums_by_parent.get(parent, 0)
 
         if expected is None:
-            # Line items found but no matching subtotal — parent_description
-            # text mismatch between passes (anchor failure)
             subtotal_results.append({
                 "parent_description": parent,
-                "expected": None,
-                "actual": actual,
-                "delta": None,
-                "passed": False,
-                "failure_reason": "no_matching_subtotal_in_pass2",
+                "expected": None, "actual": actual, "delta": None,
+                "passed": False, "failure_reason": "no_matching_subtotal_in_pass2",
             })
             all_passed = False
             continue
 
         if parent not in sums_by_parent:
-            # Subtotal found but no line items — anchor failure other direction
             subtotal_results.append({
                 "parent_description": parent,
-                "expected": expected,
-                "actual": 0,
-                "delta": -expected,
-                "passed": False,
-                "failure_reason": "no_matching_line_items_in_pass1",
+                "expected": expected, "actual": 0, "delta": -expected,
+                "passed": False, "failure_reason": "no_matching_line_items_in_pass1",
             })
             all_passed = False
             continue
@@ -605,39 +739,30 @@ def validate_format_b_cross_pass(line_items: list, subtotals_payload: dict) -> d
             all_passed = False
         subtotal_results.append({
             "parent_description": parent,
-            "expected": expected,
-            "actual": actual,
-            "delta": actual - expected,
+            "expected": expected, "actual": actual, "delta": actual - expected,
             "passed": passed,
             "failure_reason": "" if passed else "sum_mismatch",
         })
 
-    # Grand total check
     total_extracted = sum(sums_by_parent.values())
-    if grand_total is None:
-        gt_passed = False
-        gt_delta = None
-    else:
+    grand_total_int = None
+    if grand_total is not None:
         try:
             grand_total_int = int(grand_total)
         except (ValueError, TypeError):
             grand_total_int = None
-        if grand_total_int is None:
-            gt_passed = False
-            gt_delta = None
-        else:
-            gt_passed = (total_extracted == grand_total_int)
-            gt_delta = total_extracted - grand_total_int
-            grand_total = grand_total_int  # normalize for downstream
+
+    if grand_total_int is None:
+        gt_passed = False
+        gt_delta = None
+    else:
+        gt_passed = (total_extracted == grand_total_int)
+        gt_delta = total_extracted - grand_total_int
 
     grand_total_result = {
-        "expected": grand_total,
-        "actual": total_extracted,
-        "delta": gt_delta,
-        "passed": gt_passed,
+        "expected": grand_total_int, "actual": total_extracted,
+        "delta": gt_delta, "passed": gt_passed,
     }
-
-    # Grand total mismatch alone fails the document
     if not gt_passed:
         all_passed = False
 
@@ -650,16 +775,15 @@ def validate_format_b_cross_pass(line_items: list, subtotals_payload: dict) -> d
 
 
 def build_subtotal_match_note(parent_description: str, subtotal_results: list) -> str:
-    """Build a per-row note describing the subtotal match status for that row's parent group."""
     for sub in subtotal_results:
         if sub["parent_description"] == parent_description:
             if sub["passed"]:
                 return f"OK ({sub['expected']})"
             reason = sub.get("failure_reason", "")
             if reason == "no_matching_subtotal_in_pass2":
-                return f"FAIL — line items sum to {sub['actual']} but no matching bold subtotal found"
+                return f"FAIL — line items sum to {sub['actual']} but no matching bold subtotal"
             if reason == "no_matching_line_items_in_pass1":
-                return f"FAIL — subtotal {sub['expected']} found but no matching line items"
+                return f"FAIL — subtotal {sub['expected']} but no matching line items"
             return f"FAIL — expected {sub['expected']}, got {sub['actual']}, delta {sub['delta']:+d}"
     return ""
 
@@ -690,24 +814,21 @@ def process_single_file(file_id: str):
 
         pdf_bytes = download_pdf(file_id)
 
-        # Rasterize once, reuse across all Gemini calls
         try:
-            image_parts = rasterize_pdf_to_pngs(pdf_bytes)
+            image_parts = rasterize_pdf_pages(pdf_bytes)
         except Exception as e:
-            log.exception(f"Rasterization failed for {filename}: {e}")
+            log.exception(f"Rasterization failed: {e}")
             log_quarantine(filename, "rasterization_failed", str(e)[:500])
             move_file(file_id, DRIVE_QUARANTINE_FOLDER_ID)
             return
 
         if not image_parts:
-            log.warning(f"No pages rendered from {filename}")
             log_quarantine(filename, "no_pages", "PDF rasterized to zero pages")
             move_file(file_id, DRIVE_QUARANTINE_FOLDER_ID)
             return
 
-        # Pass 0: classify
         fmt = classify_format(image_parts)
-        log.info(f"{filename}: classified as '{fmt}'")
+        log.info(f"{filename}: classified as '{fmt}' ({len(image_parts)} page(s))")
 
         extracted_at = datetime.now(timezone.utc).isoformat()
         destination_tab = "American Stainless"
@@ -717,58 +838,56 @@ def process_single_file(file_id: str):
         rows = []
 
         if fmt == "detailed":
-            # Format A: single extraction call
             payload = extract_format_a(image_parts)
             project_number = payload.get("project_number", "") or ""
             raw_rows = payload.get("rows", []) or []
-            rows = [snap_row_fields(r) for r in raw_rows]
+            kept, dropped = filter_rows_with_valid_size(raw_rows)
+            if dropped:
+                log.warning(f"{filename}: dropped {dropped} Format A row(s) with empty/invalid size")
+            rows = [snap_row_fields(r) for r in kept]
 
         elif fmt == "pivot":
-            # Format B: two-pass extraction with cross-validation
-            pass1 = extract_format_b_line_items(image_parts)
+            pass1 = extract_format_b_line_items_per_page(image_parts)
             pass2 = extract_format_b_subtotals(image_parts)
             project_number = pass1.get("project_number", "") or ""
-            line_items_raw = pass1.get("rows", []) or []
+            raw_line_items = pass1.get("rows", []) or []
 
-            # Normalize Format B line items into the standard row shape, applying
-            # whitelist snaps to inherited parent_description (which becomes the row's description).
-            rows = []
-            for li in line_items_raw:
+            line_items, dropped_count = filter_rows_with_valid_size(raw_line_items)
+            if dropped_count:
+                log.warning(f"{filename}: dropped {dropped_count} Format B row(s) with invalid size (anti-hallucination)")
+
+            normalized_line_items = []
+            for li in line_items:
                 parent_desc = apply_whitelist_snaps(li.get("parent_description", "") or "")
-                rows.append({
+                normalized_line_items.append({
+                    "parent_description": parent_desc,
+                    "size": str(li.get("size", "") or "").strip(),
                     "pl_qty": li.get("pl_qty", 0),
-                    "unit": "",
-                    "size": li.get("size", "") or "",
-                    "description": parent_desc,
-                    "type": "",
-                    "foreman": "",
-                    "pl_number": "",
                 })
 
-            # Run cross-pass validation against the SAME (snapped) descriptions
-            # used in pass-1 normalization. We rebuild a comparable pass1 view
-            # using snapped descriptions so the parent keys join correctly with
-            # pass2 subtotal descriptions (which we also snap).
-            normalized_pass1 = [
-                {
-                    "parent_description": apply_whitelist_snaps(li.get("parent_description", "") or ""),
-                    "pl_qty": li.get("pl_qty", 0),
-                }
-                for li in line_items_raw
-            ]
             normalized_pass2 = {
                 "grand_total": pass2.get("grand_total"),
                 "subtotals": [
-                    {
-                        "parent_description": apply_whitelist_snaps(s.get("parent_description", "") or ""),
-                        "subtotal": s.get("subtotal", 0),
-                    }
+                    {"parent_description": apply_whitelist_snaps(s.get("parent_description", "") or ""),
+                     "subtotal": s.get("subtotal", 0)}
                     for s in (pass2.get("subtotals", []) or [])
                 ],
             }
 
-            validation = validate_format_b_cross_pass(normalized_pass1, normalized_pass2)
+            validation = validate_format_b_cross_pass(normalized_line_items, normalized_pass2)
             grand_total_note = build_grand_total_note(validation["grand_total_result"])
+
+            rows = []
+            for li in normalized_line_items:
+                rows.append({
+                    "pl_qty": li["pl_qty"],
+                    "unit": "",
+                    "size": li["size"],
+                    "description": li["parent_description"],
+                    "type": "",
+                    "foreman": "",
+                    "pl_number": "",
+                })
 
             if not validation["passed"]:
                 destination_tab = "Needs Review"
@@ -780,24 +899,20 @@ def process_single_file(file_id: str):
                 )
 
         else:
-            # Unknown format
             log.warning(f"Unknown format for {filename}")
             log_quarantine(filename, "unknown_format", "Classifier returned 'unknown'")
             move_file(file_id, DRIVE_QUARANTINE_FOLDER_ID)
             return
 
         if not rows:
-            log.warning(f"No rows extracted from {filename}")
-            log_quarantine(filename, "empty_rows", f"format={fmt}, extraction returned no rows")
+            log.warning(f"No rows after filtering for {filename}")
+            log_quarantine(filename, "empty_rows", f"format={fmt}, all rows dropped or none extracted")
             move_file(file_id, DRIVE_QUARANTINE_FOLDER_ID)
             return
 
-        # Build sheet rows. Column order matches v2 schema for backward compat
-        # of the American Stainless tab. Needs Review gets 4 extra diagnostic columns
-        # (subtotal_match, grand_total_match, validation_method, validation_notes).
         sheet_rows = []
         for row in rows:
-            base_row = [
+            item_block = [
                 parsed["vendor"],
                 parsed["rfe_number"],
                 parsed["date_received"],
@@ -809,10 +924,11 @@ def process_single_file(file_id: str):
                 row.get("type", ""),
                 row.get("foreman", ""),
                 project_number,
-                fmt,
-                filename,
-                extracted_at,
             ]
+            location_block = ["", ""]  # Connex, Shelf — filled later
+            meta_block = [fmt, filename, extracted_at]
+            base_row = item_block + location_block + meta_block
+
             if destination_tab == "Needs Review":
                 subtotal_match = build_subtotal_match_note(
                     row.get("description", ""), validation["subtotal_results"]
@@ -820,8 +936,7 @@ def process_single_file(file_id: str):
                 failed_count = sum(1 for s in validation["subtotal_results"] if not s["passed"])
                 validation_notes = (
                     f"{failed_count} group(s) failed validation"
-                    if not validation["passed"]
-                    else ""
+                    if not validation["passed"] else ""
                 )
                 base_row.extend([
                     subtotal_match,
@@ -848,7 +963,166 @@ def process_single_file(file_id: str):
 
 
 def process_inbox():
+    ensure_sheet_headers()
     files = list_inbox_pdfs()
     log.info(f"Inbox scan found {len(files)} PDF(s)")
     for f in files:
         process_single_file(f["id"])
+
+
+def reprocess_quarantine():
+    """Move every PDF from Quarantine back to Inbox, then process inbox."""
+    files = list_folder_pdfs(DRIVE_QUARANTINE_FOLDER_ID)
+    log.info(f"Quarantine scan found {len(files)} PDF(s) to reprocess")
+    for f in files:
+        try:
+            move_file(f["id"], DRIVE_INBOX_FOLDER_ID)
+            log.info(f"Moved {f['name']} from Quarantine back to Inbox")
+        except Exception as e:
+            log.exception(f"Could not move {f['name']}: {e}")
+    process_inbox()
+
+
+# ---------- Location assignment ----------
+def parse_location_text(text: str) -> dict:
+    response = GEMINI_MODEL.generate_content([LOCATION_PARSE_PROMPT, text])
+    response_text = response.text.strip()
+    response_text = re.sub(r"^```(?:json)?\s*", "", response_text)
+    response_text = re.sub(r"\s*```$", "", response_text)
+    return json.loads(response_text)
+
+
+def find_matching_rows(tab: str, assignment: dict) -> List[Dict[str, Any]]:
+    """Find sheet rows matching an assignment's filters."""
+    rfe_filter = str(assignment.get("rfe_number", "")).strip()
+    desc_filter = str(assignment.get("description_filter", "")).strip().lower()
+    size_filter = assignment.get("size_filter", []) or []
+    size_filter_normalized = [str(s).strip() for s in size_filter]
+    connex = assignment.get("connex", "")
+    shelf = assignment.get("shelf", "")
+
+    all_rows = read_tab(tab)
+    if not all_rows or len(all_rows) < 2:
+        return []
+
+    matches = []
+    for i, row in enumerate(all_rows[1:], start=2):  # row 1 is headers; data starts at sheet row 2
+        if len(row) <= COL_IDX_DESCRIPTION:
+            continue
+        row_rfe = (row[COL_IDX_RFE_NUMBER] if len(row) > COL_IDX_RFE_NUMBER else "").strip()
+        row_size = (row[COL_IDX_SIZE] if len(row) > COL_IDX_SIZE else "").strip()
+        row_desc = (row[COL_IDX_DESCRIPTION] if len(row) > COL_IDX_DESCRIPTION else "").strip().lower()
+
+        if rfe_filter and row_rfe != rfe_filter:
+            continue
+        if desc_filter and desc_filter not in row_desc:
+            continue
+        if size_filter_normalized and row_size not in size_filter_normalized:
+            continue
+
+        matches.append({
+            "row_number": i,
+            "rfe_number": row_rfe,
+            "size": row_size,
+            "description": row[COL_IDX_DESCRIPTION] if len(row) > COL_IDX_DESCRIPTION else "",
+            "proposed_connex": connex,
+            "proposed_shelf": shelf,
+        })
+    return matches
+
+
+def assign_locations_preview_impl(text: str) -> dict:
+    parsed = parse_location_text(text)
+    assignments = parsed.get("assignments", []) or []
+
+    preview = {
+        "preview_id": str(uuid.uuid4()),
+        "parsed_assignments": assignments,
+        "matches_per_tab": {},
+        "total_matches": 0,
+    }
+
+    all_updates = []
+    for tab in ("American Stainless", "Needs Review"):
+        tab_matches = []
+        for assignment in assignments:
+            tab_matches.extend(find_matching_rows(tab, assignment))
+        preview["matches_per_tab"][tab] = tab_matches
+        preview["total_matches"] += len(tab_matches)
+        for m in tab_matches:
+            all_updates.append({
+                "tab": tab,
+                "row_number": m["row_number"],
+                "connex": m["proposed_connex"],
+                "shelf": m["proposed_shelf"],
+            })
+
+    LOCATION_PREVIEWS[preview["preview_id"]] = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updates": all_updates,
+        "parsed_assignments": assignments,
+    }
+    return preview
+
+
+def assign_locations_commit_impl(preview_id: str) -> dict:
+    preview = LOCATION_PREVIEWS.get(preview_id)
+    if not preview:
+        raise HTTPException(status_code=404, detail="preview_id not found (expired or invalid)")
+
+    updates = preview.get("updates", [])
+    if not updates:
+        return {"status": "no_updates", "applied": 0}
+
+    data = []
+    connex_col_letter = _col_letter(COL_IDX_CONNEX)
+    shelf_col_letter = _col_letter(COL_IDX_SHELF)
+    for u in updates:
+        range_str = f"'{u['tab']}'!{connex_col_letter}{u['row_number']}:{shelf_col_letter}{u['row_number']}"
+        data.append({
+            "range": range_str,
+            "values": [[u["connex"], u["shelf"]]],
+        })
+
+    body = {"valueInputOption": "RAW", "data": data}
+    sheets_service.spreadsheets().values().batchUpdate(
+        spreadsheetId=SHEET_ID,
+        body=body,
+    ).execute()
+
+    applied = len(updates)
+    del LOCATION_PREVIEWS[preview_id]
+    log.info(f"Applied {applied} location update(s) from preview {preview_id}")
+    return {"status": "ok", "applied": applied}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ONE-TIME GOOGLE SHEETS SETUP (do this after first deploy)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 1. Hit /process-inbox once with no files in the inbox. This triggers
+#    ensure_sheet_headers() which writes the v4 column headers to:
+#      - American Stainless (16 cols, row 1)
+#      - Needs Review (20 cols, row 1)
+#      - Quarantine (4 cols, row 1)
+#
+# 2. Add Connex dropdown on each tab that has a Connex column:
+#    - On American Stainless: select range L2:L (Connex column)
+#    - Data → Data validation → +Add rule
+#    - Criteria: Dropdown
+#    - Values: Connex 1, Connex 2, Connex 3, Connex 4, Connex 5, Connex 6,
+#      Connex 7, Connex 8, Connex 9, Connex 10, Connex 11, Connex 12,
+#      Connex 13, Connex 14, Connex 15, Connex 16, Connex 17, Connex 18,
+#      Connex 19, Connex 20
+#    - Save
+#    - Repeat on Needs Review tab, same column letter L.
+#
+# 3. (Optional) Freeze the header row: View → Freeze → 1 row.
+#
+# 4. (Optional) Conditional formatting on Subtotal Match (Needs Review):
+#    - Text starts with FAIL → red background
+#    - Text starts with OK   → green background
+#
+# 5. The Shelf column is free text (column M). No dropdown needed.
+#
+# ════════════════════════════════════════════════════════════════════════════
