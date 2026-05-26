@@ -485,19 +485,38 @@ def move_file(file_id: str, dest_folder_id: str):
 
 # ---------- Rasterization ----------
 def rasterize_pdf_pages(pdf_bytes: bytes) -> List[Dict[str, Any]]:
-    """One PNG per page."""
+    """One PNG per page. A single bad page is skipped, not fatal.
+
+    Each page render is isolated in its own try/except so a corrupt or
+    unrenderable page (which can happen with skewed phone-scan PDFs) does
+    not crash the whole file. Only pages that actually render are kept.
+    If every page fails, an empty list is returned and the caller
+    quarantines the file.
+    """
     pdf = pdfium.PdfDocument(pdf_bytes)
     pages = []
     try:
         for page_index in range(len(pdf)):
-            page = pdf[page_index]
-            pil_image = page.render(scale=RENDER_SCALE).to_pil()
-            buf = io.BytesIO()
-            pil_image.save(buf, format="PNG", optimize=True)
-            pages.append({"mime_type": "image/png", "data": buf.getvalue()})
-            page.close()
+            page = None
+            try:
+                page = pdf[page_index]
+                pil_image = page.render(scale=RENDER_SCALE).to_pil()
+                buf = io.BytesIO()
+                pil_image.save(buf, format="PNG", optimize=True)
+                pages.append({"mime_type": "image/png", "data": buf.getvalue()})
+            except Exception as e:
+                log.warning(f"Skipping unrenderable page {page_index}: {e}")
+            finally:
+                if page is not None:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
     finally:
-        pdf.close()
+        try:
+            pdf.close()
+        except Exception:
+            pass
     return pages
 
 
@@ -585,16 +604,18 @@ def apply_whitelist_snaps(text: str) -> str:
 
 
 def is_size_valid(size: Any) -> bool:
-    """Valid = non-empty string that parses as a positive number."""
+    """Valid = any non-empty size string.
+
+    The anti-hallucination filter only needs to catch rows where Gemini
+    invented a row with NO size (blank left column). It must NOT reject
+    valid compound sizes like '5/8"x3"' or '1 1/8"-8x10 1/2"' used on bolt
+    and stud RFEs. So: a size is valid if it is simply non-empty after
+    trimming. Format B's two-pass subtotal cross-check remains the real
+    anti-hallucination safety net.
+    """
     if size is None:
         return False
-    s = str(size).strip()
-    if not s:
-        return False
-    try:
-        return float(s) > 0
-    except (ValueError, TypeError):
-        return False
+    return bool(str(size).strip())
 
 
 def filter_rows_with_valid_size(rows: List[dict]) -> Tuple[List[dict], int]:
